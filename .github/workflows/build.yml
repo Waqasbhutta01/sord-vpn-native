@@ -45,6 +45,19 @@ jobs:
             main/src/main/cpp/lz4 \
             main/src/main/cpp/openvpn3
 
+      - name: Patch CMakeLists (always build osslspeedtest)
+        run: |
+          # Skeleton mode skips OpenVPN3 (good) but also skips osslspeedtest, which
+          # react-native-simple-openvpn loads at startup. Add it back.
+          cat >> ics/main/src/main/cpp/CMakeLists.txt <<'CMK'
+
+          if (NOT TARGET osslspeedtest)
+              add_library(osslspeedtest SHARED ovpnutil/sslspeed.c)
+              target_link_libraries(osslspeedtest log crypto ssl)
+          endif ()
+          CMK
+          tail -6 ics/main/src/main/cpp/CMakeLists.txt
+
       - name: Build ${{ matrix.abi }}
         run: |
           # Path must contain build/intermediates/cmake/...skeleton.../ so CMakeLists skips
@@ -58,7 +71,7 @@ jobs:
           cmake -S ics/main/src/main/cpp -B "build-${{ matrix.abi }}" -G Ninja \
             -DCMAKE_TOOLCHAIN_FILE="$NDK/build/cmake/android.toolchain.cmake" \
             -DANDROID_ABI=${{ matrix.abi }} \
-            -DANDROID_PLATFORM=android-24 \
+            -DANDROID_PLATFORM=android-21 \
             -DANDROID_STL=c++_static \
             -DANDROID_SUPPORT_FLEXIBLE_PAGE_SIZES=ON \
             -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
@@ -70,7 +83,8 @@ jobs:
             -DCMAKE_SHARED_LINKER_FLAGS="$PAGE" \
             -DCMAKE_EXE_LINKER_FLAGS="$PAGE"
 
-          cmake --build "build-${{ matrix.abi }}" -j "$(nproc)"
+          # -k 0 = keep going, so the log shows every compile error at once
+          cmake --build "build-${{ matrix.abi }}" -j "$(nproc)" -- -k 0
 
       - name: Collect files
         run: |
