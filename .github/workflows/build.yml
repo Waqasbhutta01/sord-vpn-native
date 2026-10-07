@@ -1,0 +1,120 @@
+# Sord VPN — rebuild OpenVPN native libraries with 16 KB page alignment
+# Source: schwabe/ics-openvpn @ c4c8b8a (exact commit react-native-simple-openvpn 2.1.3 ships Java for)
+# Runs on GitHub's servers: no Android Studio, no EAS quota.
+# Actions tab -> "Build OpenVPN 16KB libs" -> Run workflow -> download artifact "vpn-jni-16kb".
+
+name: Build OpenVPN 16KB libs
+
+on:
+  workflow_dispatch:
+
+env:
+  ICS_COMMIT: c4c8b8a5ba9b567a9b4624b324e94b322357df98
+  NDK_PACKAGE: "ndk;28.2.13676358"
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        abi: [arm64-v8a, armeabi-v7a, x86_64, x86]
+    steps:
+      - name: Install build tools
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y ninja-build
+
+      - name: Install NDK r28 (16 KB aligned by default)
+        run: |
+          SDKM="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          yes | "$SDKM" --install "$NDK_PACKAGE" > /dev/null
+          NDK_DIR="$ANDROID_HOME/ndk/$(echo "$NDK_PACKAGE" | cut -d';' -f2)"
+          test -f "$NDK_DIR/build/cmake/android.toolchain.cmake"
+          echo "NDK=$NDK_DIR" >> "$GITHUB_ENV"
+          echo "Using NDK at $NDK_DIR"
+
+      - name: Fetch ics-openvpn sources
+        run: |
+          git clone https://github.com/schwabe/ics-openvpn.git ics
+          cd ics
+          git checkout "$ICS_COMMIT"
+          git submodule update --init \
+            main/src/main/cpp/openvpn \
+            main/src/main/cpp/openssl \
+            main/src/main/cpp/lz4 \
+            main/src/main/cpp/openvpn3
+
+      - name: Build ${{ matrix.abi }}
+        run: |
+          # Path must contain build/intermediates/cmake/...skeleton.../ so CMakeLists skips
+          # OpenVPN3 (libovpn3.so). The Java side in react-native-simple-openvpn never loads it.
+          OUT="$GITHUB_WORKSPACE/out/build/intermediates/cmake/skeletonRelease/obj/${{ matrix.abi }}"
+          mkdir -p "$OUT"
+
+          RELAX="-Wno-error=implicit-function-declaration -Wno-error=implicit-int -Wno-error=int-conversion -Wno-error=incompatible-function-pointer-types -Wno-error=incompatible-pointer-types -Wno-deprecated-declarations"
+          PAGE="-Wl,-z,max-page-size=16384 -Wl,-z,common-page-size=16384"
+
+          cmake -S ics/main/src/main/cpp -B "build-${{ matrix.abi }}" -G Ninja \
+            -DCMAKE_TOOLCHAIN_FILE="$NDK/build/cmake/android.toolchain.cmake" \
+            -DANDROID_ABI=${{ matrix.abi }} \
+            -DANDROID_PLATFORM=android-24 \
+            -DANDROID_STL=c++_static \
+            -DANDROID_SUPPORT_FLEXIBLE_PAGE_SIZES=ON \
+            -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_LIBRARY_OUTPUT_DIRECTORY="$OUT" \
+            -DCMAKE_RUNTIME_OUTPUT_DIRECTORY="$OUT" \
+            -DCMAKE_C_FLAGS="$RELAX" \
+            -DCMAKE_CXX_FLAGS="$RELAX" \
+            -DCMAKE_SHARED_LINKER_FLAGS="$PAGE" \
+            -DCMAKE_EXE_LINKER_FLAGS="$PAGE"
+
+          cmake --build "build-${{ matrix.abi }}" -j "$(nproc)"
+
+      - name: Collect files
+        run: |
+          OUT="$GITHUB_WORKSPACE/out/build/intermediates/cmake/skeletonRelease/obj/${{ matrix.abi }}"
+          DEST="$GITHUB_WORKSPACE/pkg/vpn-jni/${{ matrix.abi }}"
+          mkdir -p "$DEST" "$GITHUB_WORKSPACE/pkg/vpn-jni/assets"
+          cp "$OUT"/*.so "$DEST"/
+          cp "$OUT"/pie_openvpn.${{ matrix.abi }} "$GITHUB_WORKSPACE/pkg/vpn-jni/assets/"
+          "$NDK"/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip --strip-unneeded "$DEST"/*.so
+          ls -la "$DEST" "$GITHUB_WORKSPACE/pkg/vpn-jni/assets"
+
+      - name: Verify 16 KB alignment
+        run: |
+          FAIL=0
+          for f in pkg/vpn-jni/${{ matrix.abi }}/*.so pkg/vpn-jni/assets/*; do
+            BAD=$(readelf -lW "$f" | awk '$1=="LOAD" && $NF != "0x4000" && $NF != "0x10000" {print $NF}')
+            if [ -n "$BAD" ]; then echo "NOT 16KB: $f ($BAD)"; FAIL=1; else echo "OK 16KB: $f"; fi
+          done
+          for need in libopenvpn.so libovpnexec.so libovpnutil.so librsapss.so libjbcrypto.so libosslspeedtest.so; do
+            test -f "pkg/vpn-jni/${{ matrix.abi }}/$need" || { echo "MISSING $need"; FAIL=1; }
+          done
+          exit $FAIL
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: part-${{ matrix.abi }}
+          path: pkg
+          retention-days: 3
+
+  package:
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: part-*
+          path: parts
+      - name: Merge
+        run: |
+          mkdir -p final
+          for d in parts/*; do cp -r "$d"/. final/; done
+          find final -type f | sort
+      - uses: actions/upload-artifact@v4
+        with:
+          name: vpn-jni-16kb
+          path: final
+          retention-days: 30
